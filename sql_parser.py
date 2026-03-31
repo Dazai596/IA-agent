@@ -20,8 +20,31 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_duration(dur_str: str) -> timedelta:
-    """Parse HH:MM:SS duration string into timedelta."""
-    dur_str = dur_str.strip()
+    """Parse HH:MM:SS duration string into timedelta.
+    Also handles pandas Timedelta/Timestamp objects and time objects.
+    """
+    # Handle non-string types that pandas might produce
+    if isinstance(dur_str, timedelta):
+        return dur_str
+    if hasattr(dur_str, 'total_seconds'):
+        return timedelta(seconds=dur_str.total_seconds())
+    if hasattr(dur_str, 'hour') and hasattr(dur_str, 'minute'):
+        # datetime.time object
+        return timedelta(hours=dur_str.hour, minutes=dur_str.minute, seconds=dur_str.second)
+
+    dur_str = str(dur_str).strip()
+
+    # Handle pandas Timedelta string format like "0 days 04:32:35"
+    if "days" in dur_str.lower():
+        match = re.match(r"(\d+)\s*days?\s+(\d+):(\d+):(\d+)", dur_str)
+        if match:
+            return timedelta(
+                days=int(match.group(1)),
+                hours=int(match.group(2)),
+                minutes=int(match.group(3)),
+                seconds=int(match.group(4)),
+            )
+
     parts = dur_str.split(":")
     if len(parts) == 3:
         return timedelta(
@@ -63,6 +86,114 @@ def _detect_file_type(path: Path) -> str:
     return "csv"
 
 
+def _find_header_row(df: pd.DataFrame) -> int:
+    """
+    Search through the first rows of a DataFrame to find the actual header row.
+    HiveDesk HTML exports have title/metadata rows before the real column headers.
+    Returns the row index containing the header, or -1 if not found.
+    """
+    # Known column names that MUST appear in the real header row
+    required_keywords = {"duration", "activity", "active"}
+    helpful_keywords = {"project", "task", "member", "worksession", "time start", "time end"}
+
+    for idx in range(min(15, len(df))):
+        row_values = [str(v).strip().lower() for v in df.iloc[idx].values]
+        row_text = " ".join(row_values)
+
+        required_found = sum(1 for kw in required_keywords if kw in row_text)
+        helpful_found = sum(1 for kw in helpful_keywords if kw in row_text)
+
+        # Need at least 2 required keywords + 1 helpful keyword to confirm header
+        if required_found >= 2 and helpful_found >= 1:
+            return idx
+
+    return -1
+
+
+def _map_columns(df: pd.DataFrame) -> dict:
+    """
+    Map DataFrame columns to known field names by partial match.
+    Returns a dict like {"project": "Project", "duration": "Duration", ...}
+    """
+    col_map = {}
+    date_cols_found = 0
+
+    for col in df.columns:
+        col_lower = str(col).lower().strip()
+
+        if "project" in col_lower and "project" not in col_map:
+            col_map["project"] = col
+        elif ("team member" in col_lower or "member" in col_lower) and "employee" not in col_map:
+            col_map["employee"] = col
+        elif "task" in col_lower and "task" not in col_map:
+            col_map["task"] = col
+        elif "date start" in col_lower:
+            col_map["date_start"] = col
+        elif "date end" in col_lower:
+            col_map["date_end"] = col
+        elif "worksession date" in col_lower or (
+            "date" in col_lower
+            and "start" not in col_lower
+            and "end" not in col_lower
+            and "range" not in col_lower
+        ):
+            # HiveDesk has two "Worksession Date" columns (start, end)
+            if date_cols_found == 0:
+                col_map["date_start"] = col
+            else:
+                col_map["date_end"] = col
+            date_cols_found += 1
+        elif "time start" in col_lower and "time_start" not in col_map:
+            col_map["time_start"] = col
+        elif "time end" in col_lower and "time_end" not in col_map:
+            col_map["time_end"] = col
+        elif col_lower in ("type", "worksession type", "session type") or (
+            "type" in col_lower
+            and "time" not in col_lower
+            and "date" not in col_lower
+            and "session_type" not in col_map
+        ):
+            col_map["session_type"] = col
+        elif "duration" in col_lower and "duration" not in col_map:
+            col_map["duration"] = col
+        elif "active time" in col_lower or (
+            "active" in col_lower
+            and "activity" not in col_lower
+            and "active_time" not in col_map
+        ):
+            col_map["active_time"] = col
+        elif "activity" in col_lower and "activity" not in col_map:
+            col_map["activity"] = col
+        elif "cost" in col_lower and "cost" not in col_map:
+            col_map["cost"] = col
+
+    return col_map
+
+
+def _has_critical_columns(col_map: dict) -> bool:
+    """Check that at least duration + one of (active_time, activity) were found."""
+    return "duration" in col_map and ("active_time" in col_map or "activity" in col_map)
+
+
+def _is_summary_row(row) -> bool:
+    """
+    Check if a row is a summary/total/footer row.
+    Only matches cells where the ENTIRE value (stripped) is 'Total', 'Average',
+    or starts with '*'. Does NOT match substrings inside real data.
+    """
+    for val in row:
+        s = str(val).strip()
+        s_lower = s.lower()
+        if s_lower in ("total", "average", "avg", "totals"):
+            return True
+        if s.startswith("*"):
+            return True
+        # Match patterns like "74% (Avg)" in summary rows
+        if re.match(r"^\d+%?\s*\(avg\)", s_lower):
+            return True
+    return False
+
+
 def _parse_html_xls(path: Path) -> TimesheetData:
     """Parse HiveDesk HTML-based .xls export."""
     # Read raw HTML to extract metadata
@@ -89,57 +220,60 @@ def _parse_html_xls(path: Path) -> TimesheetData:
     if not dfs:
         raise ValueError(f"No tables found in {path}")
 
-    df = dfs[0]
+    # Try each table to find the one with timesheet data
+    df = None
+    for candidate_df in dfs:
+        # Flatten multi-level columns
+        if isinstance(candidate_df.columns, pd.MultiIndex):
+            candidate_df.columns = [
+                col[-1] if isinstance(col, tuple) else col
+                for col in candidate_df.columns
+            ]
 
-    # Flatten multi-level columns
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [col[-1] if isinstance(col, tuple) else col for col in df.columns]
+        # Check if this table's columns already contain known names
+        test_map = _map_columns(candidate_df)
+        if _has_critical_columns(test_map):
+            df = candidate_df
+            break
+
+        # Columns don't match — search rows for the actual header
+        header_idx = _find_header_row(candidate_df)
+        if header_idx >= 0:
+            new_cols = [str(v).strip() for v in candidate_df.iloc[header_idx].values]
+            candidate_df = candidate_df.iloc[header_idx + 1:].reset_index(drop=True)
+            candidate_df.columns = new_cols
+            test_map = _map_columns(candidate_df)
+            if _has_critical_columns(test_map):
+                df = candidate_df
+                break
+
+    if df is None:
+        # Last resort: use first table with header-row detection
+        df = dfs[0]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [
+                col[-1] if isinstance(col, tuple) else col
+                for col in df.columns
+            ]
+        header_idx = _find_header_row(df)
+        if header_idx >= 0:
+            new_cols = [str(v).strip() for v in df.iloc[header_idx].values]
+            df = df.iloc[header_idx + 1:].reset_index(drop=True)
+            df.columns = new_cols
 
     logger.info(f"Parsed timesheet with columns: {df.columns.tolist()}")
 
-    # Find relevant columns by partial match
-    col_map = {}
-    date_cols_found = 0  # Track multiple "Worksession Date" columns
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if "project" in col_lower:
-            col_map["project"] = col
-        elif "team member" in col_lower or "member" in col_lower:
-            col_map["employee"] = col
-        elif "task" in col_lower:
-            col_map["task"] = col
-        elif "date start" in col_lower:
-            col_map["date_start"] = col
-        elif "date end" in col_lower:
-            col_map["date_end"] = col
-        elif "worksession date" in col_lower or ("date" in col_lower and "start" not in col_lower and "end" not in col_lower and "range" not in col_lower):
-            # HiveDesk has two "Worksession Date" columns (start, end)
-            if date_cols_found == 0:
-                col_map["date_start"] = col
-            else:
-                col_map["date_end"] = col
-            date_cols_found += 1
-        elif "time start" in col_lower:
-            col_map["time_start"] = col
-        elif "time end" in col_lower:
-            col_map["time_end"] = col
-        elif "type" in col_lower:
-            col_map["session_type"] = col
-        elif "duration" in col_lower:
-            col_map["duration"] = col
-        elif "activity" in col_lower:
-            col_map["activity"] = col
-        elif "active" in col_lower:
-            col_map["active_time"] = col
-        elif "cost" in col_lower:
-            col_map["cost"] = col
+    col_map = _map_columns(df)
 
-    # Filter out total/summary/footer rows
-    df = df[~df.apply(
-        lambda row: row.astype(str).str.contains(
-            r"Total|Average|^\*", case=False, regex=True
-        ).any(), axis=1
-    )]
+    # Validate that critical columns were found
+    if not _has_critical_columns(col_map):
+        logger.error(
+            f"CRITICAL: Could not find Duration/Active/Activity columns! "
+            f"Available columns: {df.columns.tolist()}, Mapped: {col_map}"
+        )
+
+    # Filter out total/summary/footer rows (exact match, not substring)
+    df = df[~df.apply(_is_summary_row, axis=1)]
     df = df.dropna(how="all")
 
     logger.info(f"Column mapping: {col_map}")
@@ -160,21 +294,25 @@ def _parse_html_xls(path: Path) -> TimesheetData:
         time_end = str(row.get(col_map.get("time_end", ""), "")).strip()
         session_type = str(row.get(col_map.get("session_type", ""), "")).strip()
 
-        # Handle empty/nan values safely
-        dur_str = str(row.get(col_map.get("duration", ""), "00:00:00")).strip()
-        active_str = str(row.get(col_map.get("active_time", ""), "00:00:00")).strip()
+        # Handle empty/nan values safely — pass raw values to _parse_duration
+        # so it can handle pandas Timedelta/time objects directly
+        dur_raw = row.get(col_map.get("duration", ""), "00:00:00")
+        active_raw = row.get(col_map.get("active_time", ""), "00:00:00")
         act_pct_str = str(row.get(col_map.get("activity", ""), "0")).strip()
 
-        if dur_str in ("nan", "", "NaT"):
-            dur_str = "00:00:00"
-        if active_str in ("nan", "", "NaT"):
-            active_str = "00:00:00"
-        if act_pct_str in ("nan", ""):
+        dur_str_check = str(dur_raw).strip()
+        active_str_check = str(active_raw).strip()
+
+        if dur_str_check in ("nan", "", "NaT", "None"):
+            dur_raw = "00:00:00"
+        if active_str_check in ("nan", "", "NaT", "None"):
+            active_raw = "00:00:00"
+        if act_pct_str in ("nan", "", "None"):
             act_pct_str = "0"
 
         try:
-            duration = _parse_duration(dur_str)
-            active_time = _parse_duration(active_str)
+            duration = _parse_duration(dur_raw)
+            active_time = _parse_duration(active_raw)
             activity_pct = _parse_activity_pct(act_pct_str)
         except (ValueError, IndexError) as e:
             logger.warning(f"Skipping row due to parse error: {e}")
@@ -236,46 +374,26 @@ def _parse_xlsx(path: Path) -> TimesheetData:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[-1] if isinstance(col, tuple) else col for col in df.columns]
 
-    # Find relevant columns by partial match (same logic as HTML parser)
-    col_map = {}
-    date_cols_found = 0
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if "project" in col_lower:
-            col_map["project"] = col
-        elif "team member" in col_lower or "member" in col_lower:
-            col_map["employee"] = col
-        elif "task" in col_lower:
-            col_map["task"] = col
-        elif "date start" in col_lower:
-            col_map["date_start"] = col
-        elif "date end" in col_lower:
-            col_map["date_end"] = col
-        elif "worksession date" in col_lower or ("date" in col_lower and "start" not in col_lower and "end" not in col_lower and "range" not in col_lower):
-            if date_cols_found == 0:
-                col_map["date_start"] = col
-            else:
-                col_map["date_end"] = col
-            date_cols_found += 1
-        elif "time start" in col_lower:
-            col_map["time_start"] = col
-        elif "time end" in col_lower:
-            col_map["time_end"] = col
-        elif "type" in col_lower:
-            col_map["session_type"] = col
-        elif "duration" in col_lower:
-            col_map["duration"] = col
-        elif "activity" in col_lower:
-            col_map["activity"] = col
-        elif "active" in col_lower:
-            col_map["active_time"] = col
+    # Check if columns look right; if not, find the header row
+    col_map = _map_columns(df)
+    if not _has_critical_columns(col_map):
+        header_idx = _find_header_row(df)
+        if header_idx >= 0:
+            new_cols = [str(v).strip() for v in df.iloc[header_idx].values]
+            df = df.iloc[header_idx + 1:].reset_index(drop=True)
+            df.columns = new_cols
+            logger.info(f"XLSX: Found header at row {header_idx}, new columns: {df.columns.tolist()}")
 
-    # Filter out total/summary/footer rows
-    df = df[~df.apply(
-        lambda row: row.astype(str).str.contains(
-            r"Total|Average|^\*", case=False, regex=True
-        ).any(), axis=1
-    )]
+    col_map = _map_columns(df)
+
+    if not _has_critical_columns(col_map):
+        logger.error(
+            f"CRITICAL: Could not find Duration/Active/Activity columns in XLSX! "
+            f"Available columns: {df.columns.tolist()}, Mapped: {col_map}"
+        )
+
+    # Filter out total/summary/footer rows (exact match, not substring)
+    df = df[~df.apply(_is_summary_row, axis=1)]
     df = df.dropna(how="all")
 
     logger.info(f"XLSX column mapping: {col_map}")
@@ -296,20 +414,24 @@ def _parse_xlsx(path: Path) -> TimesheetData:
         time_end = str(row.get(col_map.get("time_end", ""), "")).strip()
         session_type = str(row.get(col_map.get("session_type", ""), "")).strip()
 
-        dur_str = str(row.get(col_map.get("duration", ""), "00:00:00")).strip()
-        active_str = str(row.get(col_map.get("active_time", ""), "00:00:00")).strip()
+        # Pass raw values to _parse_duration for pandas Timedelta/time handling
+        dur_raw = row.get(col_map.get("duration", ""), "00:00:00")
+        active_raw = row.get(col_map.get("active_time", ""), "00:00:00")
         act_pct_str = str(row.get(col_map.get("activity", ""), "0")).strip()
 
-        if dur_str in ("nan", "", "NaT"):
-            dur_str = "00:00:00"
-        if active_str in ("nan", "", "NaT"):
-            active_str = "00:00:00"
-        if act_pct_str in ("nan", ""):
+        dur_str_check = str(dur_raw).strip()
+        active_str_check = str(active_raw).strip()
+
+        if dur_str_check in ("nan", "", "NaT", "None"):
+            dur_raw = "00:00:00"
+        if active_str_check in ("nan", "", "NaT", "None"):
+            active_raw = "00:00:00"
+        if act_pct_str in ("nan", "", "None"):
             act_pct_str = "0"
 
         try:
-            duration = _parse_duration(dur_str)
-            active_time = _parse_duration(active_str)
+            duration = _parse_duration(dur_raw)
+            active_time = _parse_duration(active_raw)
             activity_pct = _parse_activity_pct(act_pct_str)
         except (ValueError, IndexError) as e:
             logger.warning(f"Skipping row due to parse error: {e}")
