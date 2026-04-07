@@ -49,19 +49,11 @@ def _build_vision_message(image_bytes: bytes, timestamp: str) -> HumanMessage:
 
 def _parse_classification(raw: str, timestamp: str) -> ScreenshotClassification:
     """Parse the LLM JSON response into a ScreenshotClassification."""
-    import json
+    from helpers import safe_parse_llm_json
 
-    # Try to extract JSON from the response
-    text = raw.strip()
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0].strip()
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0].strip()
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        logger.warning(f"Failed to parse LLM response as JSON: {text[:200]}")
+    data = safe_parse_llm_json(raw)
+    if not data:
+        logger.warning(f"Failed to parse LLM classification response: {raw[:200]}")
         return ScreenshotClassification(
             timestamp=timestamp,
             category=ScreenshotCategory.UNCERTAIN,

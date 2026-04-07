@@ -103,17 +103,18 @@ SUSPICIOUS_SITE_BLOCKLIST = {
     "tiktok.com": ("Social media", "social"),
     "snapchat": ("Social media", "social"),
     "pinterest": ("Social media", "social"),
-    "reddit.com": ("Social media/forum", "social"),
+    # reddit.com removed — many web devs use tech subreddits for work research
     # Dating
     "tinder": ("Dating app", "personal"),
     "bumble": ("Dating app", "personal"),
     "hinge": ("Dating app", "personal"),
-    # Shopping
-    "amazon.com": ("Shopping", "shopping"),
+    # Shopping (amazon excluded — too many false positives with AWS)
     "ebay.com": ("Shopping", "shopping"),
     "aliexpress": ("Shopping", "shopping"),
     "wish.com": ("Shopping", "shopping"),
     "etsy.com": ("Shopping", "shopping"),
+    "amazon.com/gp": ("Amazon shopping", "shopping"),
+    "amazon.com/dp": ("Amazon product page", "shopping"),
     # Gaming
     "steampowered": ("Gaming platform", "gaming"),
     "store.steampowered": ("Gaming store", "gaming"),
@@ -121,11 +122,46 @@ SUSPICIOUS_SITE_BLOCKLIST = {
     "roblox": ("Gaming", "gaming"),
     "minecraft": ("Gaming", "gaming"),
     # Sports / betting
-    "espn": ("Sports", "sports"),
     "bet365": ("Gambling", "gambling"),
     "draftkings": ("Sports betting", "gambling"),
     "fanduel": ("Sports betting", "gambling"),
 }
+
+# Domains that look like blocklist matches but are legitimate work tools
+# Extended for web developers — these are essential developer resources
+_WORK_DOMAIN_ALLOWLIST = {
+    # Cloud / hosting
+    "aws.amazon.com", "console.aws.amazon",
+    "docs.aws.amazon", "s3.amazonaws",
+    # Developer resources commonly visited by web devs
+    "github.com", "gitlab.com", "bitbucket.org",
+    "stackoverflow.com", "stackexchange.com",
+    "npmjs.com", "yarnpkg.com", "pypi.org",
+    "developer.mozilla.org", "mdn.mozilla.org",
+    "w3schools.com", "css-tricks.com",
+    "dev.to", "medium.com",  # Tech blogs
+    "hackernews", "news.ycombinator.com",
+    # Design / API / DevOps tools
+    "figma.com", "postman.com", "insomnia.rest",
+    "vercel.com", "netlify.com", "heroku.com",
+    "cloudflare.com", "digitalocean.com",
+    "docker.com", "hub.docker.com",
+    # Documentation sites
+    "reactjs.org", "nextjs.org", "vuejs.org", "angular.io",
+    "tailwindcss.com", "getbootstrap.com",
+    "typescriptlang.org", "nodejs.org",
+    "python.org", "docs.python.org",
+    "laravel.com", "djangoproject.com",
+    # Code playgrounds
+    "codepen.io", "codesandbox.io",
+    "stackblitz.com", "jsfiddle.net",
+    "replit.com",
+}
+
+# ── OCR cache for reuse across detections ─────────────────────────────────
+
+_ocr_cache: dict[int, str] = {}  # image_index -> OCR text
+_ocr_top_cache: dict[int, str] = {}  # image_index -> top-region OCR text
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,16 +210,33 @@ def _ocr_image(image: Image.Image, region: Optional[tuple] = None) -> str:
     return ""
 
 
-def _ocr_top_region(image: Image.Image, height_pct: float = 0.08) -> str:
-    """OCR just the top portion of a screenshot (address bar / tab bar area)."""
+def _ocr_top_region(image: Image.Image, height_pct: float = 0.08, cache_key: int = -1) -> str:
+    """OCR just the top portion of a screenshot (address bar / tab bar area).
+    Uses cache if cache_key is provided and result is already cached."""
+    if cache_key >= 0 and cache_key in _ocr_top_cache:
+        return _ocr_top_cache[cache_key]
     w, h = image.size
     top_region = (0, 0, w, int(h * height_pct))
-    return _ocr_image(image, region=top_region)
+    result = _ocr_image(image, region=top_region)
+    if cache_key >= 0:
+        _ocr_top_cache[cache_key] = result
+    return result
 
 
-def _ocr_full(image: Image.Image) -> str:
-    """OCR the full screenshot."""
-    return _ocr_image(image)
+def _ocr_full(image: Image.Image, cache_key: int = -1) -> str:
+    """OCR the full screenshot. Uses cache if available."""
+    if cache_key >= 0 and cache_key in _ocr_cache:
+        return _ocr_cache[cache_key]
+    result = _ocr_image(image)
+    if cache_key >= 0:
+        _ocr_cache[cache_key] = result
+    return result
+
+
+def clear_ocr_cache() -> None:
+    """Clear OCR caches between runs."""
+    _ocr_cache.clear()
+    _ocr_top_cache.clear()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -215,11 +268,11 @@ def detect_repeated_frames(
             continue
         try:
             h = imagehash.phash(img, hash_size=16)  # 16x16 = 256-bit hash for accuracy
-            # Also grab OCR text for visible_content if OCR available
+            # Also grab OCR text for visible_content if OCR available (uses cache)
             ocr_text = ""
             if HAS_TESSERACT or HAS_EASYOCR:
                 try:
-                    ocr_text = _ocr_top_region(img)[:200]
+                    ocr_text = _ocr_top_region(img, cache_key=entry.image_index)[:200]
                 except Exception:
                     pass
             hashed.append((entry, h, ocr_text))
@@ -372,11 +425,12 @@ def detect_tab_switching(
 
 def detect_monitor_changes(
     entries: list[ScreenshotEntry],
-    dual_monitor_ratio: float = 2.5,
+    dual_monitor_ratio: float = 3.0,
 ) -> list[MonitorInconsistency]:
     """
     Detect when screen resolution / monitor layout changes within the same day.
-    Ultra-wide aspect ratio (>2.5:1) = dual monitor. Normal (~16:9) = single.
+    Ultra-wide aspect ratio (>3.0:1) = dual monitor. Normal (~16:9 or 21:9) = single.
+    Threshold raised to 3.0 to avoid flagging ultrawide monitors (21:9 = 2.33:1).
     """
     if not entries:
         return []
@@ -476,17 +530,22 @@ def detect_unauthorized_sites(
         if img is None:
             continue
         try:
-            # OCR the top region (address bar / tabs)
-            top_text = _ocr_top_region(img, height_pct=0.10)
+            # OCR the top region (address bar / tabs) with caching
+            top_text = _ocr_top_region(img, height_pct=0.10, cache_key=entry.image_index)
             if not top_text:
                 continue
 
             domains = _extract_domains_from_text(top_text)
             for domain in domains:
-                # Check if domain is authorized
+                # Skip known work domains
+                if any(wd in domain for wd in _WORK_DOMAIN_ALLOWLIST):
+                    continue
+                # Check if domain is authorized (proper suffix matching)
                 is_allowed = False
                 for a in allowed:
-                    if a in domain or domain in a:
+                    # Proper domain matching: "github.com" matches "api.github.com"
+                    # but not "github.com.phishing.io"
+                    if domain == a or domain.endswith("." + a):
                         is_allowed = True
                         break
                 if not is_allowed:
@@ -539,8 +598,8 @@ def detect_third_party_accounts(
         if img is None:
             continue
         try:
-            # OCR the full screenshot — email addresses can appear anywhere
-            full_text = _ocr_full(img)
+            # OCR the full screenshot with caching
+            full_text = _ocr_full(img, cache_key=entry.image_index)
             if not full_text:
                 continue
 
@@ -550,8 +609,11 @@ def detect_third_party_accounts(
                 # Skip the employee's own email or already-flagged ones
                 if email == employee_email_lower or email in seen_emails:
                     continue
+                # Skip same-domain emails (coworkers)
+                if employee_domain and email.endswith("@" + employee_domain):
+                    continue
                 # Skip common system/no-reply addresses
-                if any(x in email for x in ["noreply", "no-reply", "mailer-daemon", "notification"]):
+                if any(x in email for x in ["noreply", "no-reply", "mailer-daemon", "notification", "support@", "info@", "admin@"]):
                     continue
                 seen_emails.add(email)
                 found.append(ThirdPartyAccount(
@@ -595,13 +657,16 @@ def detect_suspicious_sites(
         if img is None:
             continue
         try:
-            top_text = _ocr_top_region(img, height_pct=0.10)
+            top_text = _ocr_top_region(img, height_pct=0.10, cache_key=entry.image_index)
             if not top_text:
                 continue
 
             text_lower = top_text.lower()
             for keyword, (reason, category) in SUSPICIOUS_SITE_BLOCKLIST.items():
                 if keyword in text_lower and keyword not in flagged:
+                    # Skip if the match is in a work-context domain
+                    if any(wd in text_lower for wd in _WORK_DOMAIN_ALLOWLIST):
+                        continue
                     flagged.add(keyword)
                     found.append(SuspiciousSite(
                         timestamp=entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
@@ -621,6 +686,80 @@ def detect_suspicious_sites(
 #  MASTER FUNCTION: Run all advanced analyses
 # ══════════════════════════════════════════════════════════════════════════════
 
+def detect_frozen_screens(
+    entries: list[ScreenshotEntry],
+    min_consecutive: int = 3,
+) -> list[RepeatedFrame]:
+    """
+    Detect consecutive screenshots that are nearly identical (frozen screen).
+    Unlike detect_repeated_frames which compares all pairs, this specifically
+    looks for sequences of consecutive identical frames — stronger fraud signal.
+    """
+    if not HAS_IMAGEHASH or len(entries) < min_consecutive:
+        return []
+
+    # Compute hashes for all entries
+    hashed: list[tuple[ScreenshotEntry, "imagehash.ImageHash"]] = []
+    for entry in entries:
+        img = _load_image(entry)
+        if img is None:
+            continue
+        try:
+            h = imagehash.phash(img, hash_size=16)
+            hashed.append((entry, h))
+        except Exception:
+            pass
+        finally:
+            img.close()
+
+    if len(hashed) < min_consecutive:
+        return []
+
+    max_bits = 16 * 16
+    frozen: list[RepeatedFrame] = []
+    streak_start = 0
+
+    for i in range(1, len(hashed)):
+        entry_a, hash_a = hashed[i - 1]
+        entry_b, hash_b = hashed[i]
+        distance = hash_a - hash_b
+        similarity = 1.0 - (distance / max_bits)
+
+        if similarity < 0.95:
+            # Streak broken — check if it was long enough
+            streak_len = i - streak_start
+            if streak_len >= min_consecutive:
+                first_entry = hashed[streak_start][0]
+                last_entry = hashed[i - 1][0]
+                gap_sec = abs((last_entry.timestamp - first_entry.timestamp).total_seconds())
+                frozen.append(RepeatedFrame(
+                    first_occurrence=first_entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    repeat_occurrence=last_entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    time_gap_minutes=round(gap_sec / 60, 1),
+                    similarity_score=0.99,
+                    visible_content=f"Frozen screen: {streak_len} consecutive identical frames",
+                ))
+            streak_start = i
+
+    # Check final streak
+    streak_len = len(hashed) - streak_start
+    if streak_len >= min_consecutive:
+        first_entry = hashed[streak_start][0]
+        last_entry = hashed[-1][0]
+        gap_sec = abs((last_entry.timestamp - first_entry.timestamp).total_seconds())
+        frozen.append(RepeatedFrame(
+            first_occurrence=first_entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            repeat_occurrence=last_entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            time_gap_minutes=round(gap_sec / 60, 1),
+            similarity_score=0.99,
+            visible_content=f"Frozen screen: {streak_len} consecutive identical frames",
+        ))
+
+    if frozen:
+        logger.info(f"Found {len(frozen)} frozen screen sequences.")
+    return frozen
+
+
 def run_advanced_analysis(
     entries: list[ScreenshotEntry],
     employee_email: str = "",
@@ -636,6 +775,9 @@ def run_advanced_analysis(
     """
     logger.info(f"Running advanced screenshot analysis on {len(entries)} entries...")
 
+    # Clear OCR caches from any previous run
+    clear_ocr_cache()
+
     # Read thresholds from config
     from config import get_settings
     settings = get_settings()
@@ -647,6 +789,16 @@ def run_advanced_analysis(
         min_time_gap_minutes=settings.phash_min_time_gap_minutes,
     )
     logger.info(f"  Repeated frames: {len(repeated)} found")
+
+    # Consecutive frozen screen detection
+    frozen = detect_frozen_screens(entries)
+    if frozen:
+        logger.info(f"  Frozen screens: {len(frozen)} sequences found")
+        # Merge with repeated frames (avoid duplicates)
+        existing_pairs = {(r.first_occurrence, r.repeat_occurrence) for r in repeated}
+        for f in frozen:
+            if (f.first_occurrence, f.repeat_occurrence) not in existing_pairs:
+                repeated.append(f)
 
     # FIX 6: Monitor changes
     monitor = detect_monitor_changes(entries)
@@ -671,6 +823,9 @@ def run_advanced_analysis(
     # FIX 10: Suspicious sites (requires OCR)
     suspicious = detect_suspicious_sites(entries)
     logger.info(f"  Suspicious sites: {len(suspicious)} flagged")
+
+    # Clear caches to free memory
+    clear_ocr_cache()
 
     return {
         "repeated_frames": repeated,

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from datetime import timedelta
 from typing import Optional
@@ -25,7 +26,13 @@ from models import (
     WorkSession,
 )
 from config import get_llm, get_settings
-from helpers import format_timedelta, safe_divide
+from helpers import (
+    detect_duplicate_sessions,
+    detect_session_overlaps,
+    format_timedelta,
+    safe_divide,
+    safe_parse_llm_json,
+)
 from prompts import TIMESHEET_REASONING_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -47,14 +54,29 @@ def _parse_time_hour(time_str: str) -> int:
     return hour
 
 
+def _parse_time_minutes(time_str: str) -> int:
+    """Extract total minutes since midnight from time string."""
+    time_str = time_str.strip().upper()
+    parts = time_str.replace(":", " ").replace("AM", "").replace("PM", "").split()
+    if len(parts) < 2:
+        return 0
+    hour = int(parts[0])
+    minute = int(parts[1])
+    is_pm = "PM" in time_str
+    is_am = "AM" in time_str
+    if is_am and hour == 12:
+        hour = 0
+    elif is_pm and hour != 12:
+        hour += 12
+    return hour * 60 + minute
+
+
 def _detect_anomalies(sessions: list[WorkSession]) -> list[SessionAnomaly]:
     """Detect anomalies in work sessions using rule-based checks."""
     settings = get_settings()
     anomalies: list[SessionAnomaly] = []
 
     for s in sessions:
-        start_hour = _parse_time_hour(s.time_start)
-
         # Very short session
         if s.duration_minutes < settings.very_short_session_min:
             anomalies.append(
@@ -100,9 +122,9 @@ def _detect_anomalies(sessions: list[WorkSession]) -> list[SessionAnomaly]:
                 )
             )
 
-        # High idle time ratio
+        # High idle time ratio — use configured threshold (higher for devs)
         idle_ratio = safe_divide(s.idle_minutes, s.duration_minutes)
-        if s.duration_minutes > 30 and idle_ratio > 0.5:
+        if s.duration_minutes > 30 and idle_ratio > settings.idle_ratio_threshold:
             anomalies.append(
                 SessionAnomaly(
                     session_date=s.date_start,
@@ -119,6 +141,244 @@ def _detect_anomalies(sessions: list[WorkSession]) -> list[SessionAnomaly]:
     return anomalies
 
 
+def _detect_advanced_anomalies(sessions: list[WorkSession]) -> list[SessionAnomaly]:
+    """Detect advanced fraud patterns not covered by basic anomaly checks."""
+    anomalies: list[SessionAnomaly] = []
+    if len(sessions) < 3:
+        return anomalies
+
+    # ── 1. Overlapping sessions (impossible for one person) ──────────────
+    session_dicts = [
+        {
+            "date_start": s.date_start,
+            "time_start": s.time_start,
+            "time_end": s.time_end,
+            "duration_minutes": s.duration_minutes,
+        }
+        for s in sessions
+    ]
+    overlaps = detect_session_overlaps(session_dicts)
+    for o in overlaps:
+        anomalies.append(
+            SessionAnomaly(
+                session_date=o["date"],
+                session_time=o["session_1"],
+                anomaly_type="overlapping_sessions",
+                description=(
+                    f"Sessions overlap: {o['session_1']} and {o['session_2']} "
+                    f"({o['overlap_minutes']:.0f} min overlap)"
+                ),
+                severity="high",
+            )
+        )
+
+    # ── 2. Duplicate sessions ────────────────────────────────────────────
+    dup_dicts = [
+        {
+            "employee": s.employee,
+            "date_start": s.date_start,
+            "time_start": s.time_start,
+            "duration_minutes": s.duration_minutes,
+        }
+        for s in sessions
+    ]
+    duplicates = detect_duplicate_sessions(dup_dicts)
+    for d in duplicates:
+        anomalies.append(
+            SessionAnomaly(
+                session_date=d["date"],
+                session_time=d["time_start"],
+                anomaly_type="duplicate_session",
+                description=(
+                    f"Duplicate session detected: {d['duration_minutes']:.0f} min "
+                    f"appearing {d['count']} times"
+                ),
+                severity="high",
+            )
+        )
+
+    # ── 3. Suspiciously round durations ──────────────────────────────────
+    round_count = 0
+    for s in sessions:
+        dur_min = s.duration_minutes
+        if dur_min > 0 and dur_min % 30 == 0:  # Exactly 30, 60, 90, 120, etc.
+            round_count += 1
+    round_pct = safe_divide(round_count, len(sessions)) * 100
+    if round_pct > 70 and len(sessions) >= 5:
+        anomalies.append(
+            SessionAnomaly(
+                session_date=sessions[0].date_start,
+                session_time="",
+                anomaly_type="round_durations",
+                description=(
+                    f"{round_pct:.0f}% of sessions ({round_count}/{len(sessions)}) "
+                    f"have exactly round durations (multiples of 30 min) — "
+                    f"statistically unlikely for real work"
+                ),
+                severity="high",
+            )
+        )
+
+    # ── 4. Mouse jiggler / activity simulator detection ──────────────────
+    # Suspiciously stable activity across many sessions
+    # For web devs, threshold is tighter (std_dev < 2.0) since devs in flow
+    # can have genuinely consistent patterns
+    settings = get_settings()
+    if len(sessions) >= 10:
+        activities = [s.activity_pct for s in sessions if s.duration_minutes > 10]
+        if len(activities) >= 10:
+            mean_act = sum(activities) / len(activities)
+            variance = sum((a - mean_act) ** 2 for a in activities) / len(activities)
+            std_dev = math.sqrt(variance)
+            if std_dev < settings.activity_stability_threshold and mean_act > 50:
+                anomalies.append(
+                    SessionAnomaly(
+                        session_date=sessions[0].date_start,
+                        session_time="",
+                        anomaly_type="activity_too_stable",
+                        description=(
+                            f"Activity suspiciously stable: mean={mean_act:.1f}%, "
+                            f"std_dev={std_dev:.1f}% across {len(activities)} sessions. "
+                            f"Even focused developers show more variance. Possible mouse jiggler."
+                        ),
+                        severity="high",
+                    )
+                )
+
+    # ── 5. Suspiciously regular start times ──────────────────────────────
+    if len(sessions) >= 7:
+        start_minutes = []
+        for s in sessions:
+            if s.time_start:
+                m = _parse_time_minutes(s.time_start)
+                if m > 0:
+                    start_minutes.append(m)
+        if len(start_minutes) >= 7:
+            mean_start = sum(start_minutes) / len(start_minutes)
+            var_start = sum((m - mean_start) ** 2 for m in start_minutes) / len(start_minutes)
+            std_start = math.sqrt(var_start)
+            if std_start < settings.start_time_regularity_threshold:
+                anomalies.append(
+                    SessionAnomaly(
+                        session_date=sessions[0].date_start,
+                        session_time="",
+                        anomaly_type="regular_start_times",
+                        description=(
+                            f"Start times suspiciously regular: std_dev={std_start:.1f} min "
+                            f"across {len(start_minutes)} sessions. "
+                            f"Possible automated scheduling."
+                        ),
+                        severity="medium",
+                    )
+                )
+
+    # ── 6. Cross-day excessive hours ─────────────────────────────────────
+    daily_hours: dict[str, float] = defaultdict(float)
+    for s in sessions:
+        daily_hours[s.date_start] += s.duration_minutes / 60
+    for date, hours in daily_hours.items():
+        if hours > settings.excessive_daily_hours:
+            anomalies.append(
+                SessionAnomaly(
+                    session_date=date,
+                    session_time="",
+                    anomaly_type="excessive_daily_hours",
+                    description=(
+                        f"Total billed hours on {date}: {hours:.1f}h "
+                        f"(across all projects). Over {settings.excessive_daily_hours:.0f}h in a single day is suspicious."
+                    ),
+                    severity="high",
+                )
+            )
+
+    # ── 7. Inter-session gap regularity ──────────────────────────────────
+    if len(sessions) >= 5:
+        # Sort sessions chronologically
+        sorted_sessions = sorted(sessions, key=lambda s: (s.date_start, s.time_start))
+        gaps: list[float] = []
+        for i in range(len(sorted_sessions) - 1):
+            s1 = sorted_sessions[i]
+            s2 = sorted_sessions[i + 1]
+            if s1.date_start == s2.date_start:
+                end_min = _parse_time_minutes(s1.time_end) if s1.time_end else (
+                    _parse_time_minutes(s1.time_start) + s1.duration_minutes
+                )
+                start_min = _parse_time_minutes(s2.time_start)
+                gap = start_min - end_min
+                if 0 < gap < 480:  # Reasonable gap (0 to 8 hours)
+                    gaps.append(gap)
+
+        if len(gaps) >= 5:
+            mean_gap = sum(gaps) / len(gaps)
+            var_gap = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+            std_gap = math.sqrt(var_gap)
+            if std_gap < settings.gap_regularity_threshold and mean_gap > 0:
+                anomalies.append(
+                    SessionAnomaly(
+                        session_date=sorted_sessions[0].date_start,
+                        session_time="",
+                        anomaly_type="regular_gaps",
+                        description=(
+                            f"Inter-session gaps suspiciously regular: "
+                            f"mean={mean_gap:.0f} min, std_dev={std_gap:.1f} min "
+                            f"across {len(gaps)} gaps. Possible automation."
+                        ),
+                        severity="medium",
+                    )
+                )
+
+    # ── 8. Identical repeated session patterns ───────────────────────────
+    # Same (task, duration, activity) on consecutive days
+    if len(sessions) >= 5:
+        sorted_by_date = sorted(sessions, key=lambda s: s.date_start)
+        streak = 1
+        for i in range(1, len(sorted_by_date)):
+            s_prev = sorted_by_date[i - 1]
+            s_curr = sorted_by_date[i]
+            same_pattern = (
+                s_prev.task == s_curr.task
+                and abs(s_prev.duration_minutes - s_curr.duration_minutes) < 2
+                and abs(s_prev.activity_pct - s_curr.activity_pct) < 2
+            )
+            if same_pattern:
+                streak += 1
+            else:
+                if streak >= 5:
+                    anomalies.append(
+                        SessionAnomaly(
+                            session_date=sorted_by_date[i - streak].date_start,
+                            session_time="",
+                            anomaly_type="identical_pattern_streak",
+                            description=(
+                                f"{streak} consecutive sessions with identical pattern: "
+                                f"task='{s_prev.task}', duration~{s_prev.duration_minutes:.0f}min, "
+                                f"activity~{s_prev.activity_pct:.0f}%. "
+                                f"Strongly suggests template/fabricated entries."
+                            ),
+                            severity="high",
+                        )
+                    )
+                streak = 1
+        # Check final streak
+        if streak >= 5:
+            s = sorted_by_date[-1]
+            anomalies.append(
+                SessionAnomaly(
+                    session_date=sorted_by_date[-streak].date_start,
+                    session_time="",
+                    anomaly_type="identical_pattern_streak",
+                    description=(
+                        f"{streak} consecutive sessions with identical pattern: "
+                        f"task='{s.task}', duration~{s.duration_minutes:.0f}min, "
+                        f"activity~{s.activity_pct:.0f}%."
+                    ),
+                    severity="high",
+                )
+            )
+
+    return anomalies
+
+
 def _compute_daily_breakdown(sessions: list[WorkSession]) -> dict[str, float]:
     """Compute total hours worked per day."""
     daily: dict[str, float] = defaultdict(float)
@@ -128,7 +388,7 @@ def _compute_daily_breakdown(sessions: list[WorkSession]) -> dict[str, float]:
 
 
 def _compute_duckdb_stats(sessions: list[WorkSession]) -> dict:
-    """Use DuckDB for efficient aggregate computation."""
+    """Use DuckDB for efficient aggregate computation including enhanced stats."""
     records = []
     for s in sessions:
         records.append({
@@ -138,6 +398,7 @@ def _compute_duckdb_stats(sessions: list[WorkSession]) -> dict:
             "idle_min": s.idle_minutes,
             "activity_pct": s.activity_pct,
             "start_hour": _parse_time_hour(s.time_start),
+            "start_minutes": _parse_time_minutes(s.time_start),
         })
 
     df = pd.DataFrame(records)
@@ -155,8 +416,53 @@ def _compute_duckdb_stats(sessions: list[WorkSession]) -> dict:
             MAX(activity_pct) as max_activity,
             SUM(CASE WHEN activity_pct < 50 THEN 1 ELSE 0 END) as low_activity_sessions,
             SUM(CASE WHEN duration_min < 5 THEN 1 ELSE 0 END) as very_short,
-            SUM(CASE WHEN duration_min > 360 THEN 1 ELSE 0 END) as very_long
+            SUM(CASE WHEN duration_min > 360 THEN 1 ELSE 0 END) as very_long,
+            COALESCE(STDDEV(activity_pct), 0) as activity_std_dev,
+            COALESCE(STDDEV(duration_min), 0) as duration_std_dev,
+            COALESCE(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY duration_min), 0) as p25_duration,
+            COALESCE(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY duration_min), 0) as p75_duration,
+            COALESCE(STDDEV(start_minutes), 0) as start_time_std
         FROM sessions
+    """).fetchone()
+
+    # Round duration check
+    round_check = con.execute("""
+        SELECT
+            SUM(CASE WHEN duration_min > 0 AND duration_min % 30 = 0 THEN 1 ELSE 0 END) * 100.0
+            / GREATEST(COUNT(*), 1) as round_pct
+        FROM sessions
+    """).fetchone()
+
+    # Daily hours stats
+    daily_stats = con.execute("""
+        SELECT
+            MAX(daily_hours) as max_daily,
+            SUM(CASE WHEN daily_hours > 12 THEN 1 ELSE 0 END) as days_over_12
+        FROM (
+            SELECT date, SUM(duration_min) / 60.0 as daily_hours
+            FROM sessions GROUP BY date
+        )
+    """).fetchone()
+
+    # Gap analysis (between same-day sessions)
+    gap_stats = con.execute("""
+        WITH ordered AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY date ORDER BY start_minutes) as rn
+            FROM sessions
+        ),
+        gaps AS (
+            SELECT
+                a.date,
+                b.start_minutes - (a.start_minutes + a.duration_min) as gap_min
+            FROM ordered a
+            JOIN ordered b ON a.date = b.date AND a.rn = b.rn - 1
+            WHERE b.start_minutes - (a.start_minutes + a.duration_min) > 0
+              AND b.start_minutes - (a.start_minutes + a.duration_min) < 480
+        )
+        SELECT
+            COALESCE(AVG(gap_min), 0) as avg_gap,
+            COALESCE(STDDEV(gap_min), 0) as gap_std
+        FROM gaps
     """).fetchone()
 
     con.close()
@@ -172,6 +478,16 @@ def _compute_duckdb_stats(sessions: list[WorkSession]) -> dict:
         "low_activity_sessions": int(stats[7]),
         "very_short": int(stats[8]),
         "very_long": int(stats[9]),
+        "activity_std_dev": float(stats[10]),
+        "duration_std_dev": float(stats[11]),
+        "p25_duration": float(stats[12]),
+        "p75_duration": float(stats[13]),
+        "start_time_std": float(stats[14]),
+        "round_duration_pct": float(round_check[0]) if round_check else 0.0,
+        "max_daily_hours": float(daily_stats[0]) if daily_stats and daily_stats[0] else 0.0,
+        "days_over_12h": int(daily_stats[1]) if daily_stats and daily_stats[1] else 0,
+        "avg_gap_min": float(gap_stats[0]) if gap_stats else 0.0,
+        "gap_std_min": float(gap_stats[1]) if gap_stats else 0.0,
     }
 
 
@@ -189,7 +505,6 @@ def _llm_timesheet_reasoning(
 
     llm = get_llm(temperature=0.0, max_tokens=1500)
 
-    # Build a rich data payload for the LLM
     session_details = []
     for s in sessions:
         session_details.append({
@@ -230,6 +545,17 @@ def _llm_timesheet_reasoning(
         "daily_breakdown_hours": result.daily_breakdown,
         "anomalies": anomaly_details,
         "all_sessions": session_details,
+        # Enhanced stats
+        "activity_std_dev": result.activity_std_dev,
+        "duration_std_dev": result.duration_std_dev,
+        "p25_duration_min": result.p25_duration_min,
+        "p75_duration_min": result.p75_duration_min,
+        "round_duration_pct": result.round_duration_pct,
+        "duplicate_sessions": result.duplicate_session_count,
+        "overlapping_sessions": result.overlapping_session_count,
+        "max_daily_hours": result.max_daily_hours,
+        "days_over_12h": result.days_over_12h,
+        "start_time_std_min": result.start_time_std_min,
     }
 
     prompt = TIMESHEET_REASONING_PROMPT.format(
@@ -242,13 +568,12 @@ def _llm_timesheet_reasoning(
             HumanMessage(content=prompt),
         ])
         text = response.content.strip()
-        del response  # Free full response object
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
+        del response
 
-        data = json.loads(text)
+        data = safe_parse_llm_json(text)
+        if not data:
+            return ""
+
         parts = []
         assessment = data.get("overall_assessment", "")
         if assessment:
@@ -269,15 +594,7 @@ def _compute_suspicious_windows(
     screenshot_analysis=None,
 ) -> tuple[list[SuspiciousWindow], str, float]:
     """
-    FIX 5: Compute suspicious time windows and total suspicious hours.
-
-    Suspicious windows come from:
-    - Sessions with very low activity (high idle ratio)
-    - Very long sessions flagged as anomalies
-    - Time gaps covered by repeated frames (from screenshot analysis)
-    - Tab-switching loop periods
-
-    Returns: (suspicious_windows, suspicious_hours_total_str, suspicious_pct)
+    Compute suspicious time windows and total suspicious hours.
     """
     from datetime import timedelta
 
@@ -288,9 +605,10 @@ def _compute_suspicious_windows(
     for s in sessions:
         total_session_seconds += s.duration.total_seconds()
 
-        # Sessions with >50% idle time and duration > 30 min are suspicious
+        # Sessions with high idle ratio and duration > 30 min are suspicious
         idle_ratio = safe_divide(s.idle_minutes, s.duration_minutes)
-        if s.duration_minutes > 30 and idle_ratio > 0.5:
+        settings = get_settings()
+        if s.duration_minutes > 30 and idle_ratio > settings.idle_ratio_threshold:
             suspicious_seconds = s.idle_minutes * 60
             total_suspicious_seconds += suspicious_seconds
             idle_td = timedelta(seconds=suspicious_seconds)
@@ -346,7 +664,6 @@ def analyze_timesheet(timesheet: TimesheetData, screenshot_analysis=None) -> Tim
     """
     Perform complete statistical analysis of timesheet data.
     Returns structured metrics, detected anomalies, and LLM reasoning.
-    screenshot_analysis: optional ScreenshotAnalysisResult for cross-referencing suspicious windows.
     """
     if not timesheet.sessions:
         return TimesheetAnalysisResult(
@@ -366,6 +683,9 @@ def analyze_timesheet(timesheet: TimesheetData, screenshot_analysis=None) -> Tim
 
     stats = _compute_duckdb_stats(timesheet.sessions)
     anomalies = _detect_anomalies(timesheet.sessions)
+    advanced_anomalies = _detect_advanced_anomalies(timesheet.sessions)
+    anomalies.extend(advanced_anomalies)
+
     daily = _compute_daily_breakdown(timesheet.sessions)
 
     overall_activity = safe_divide(
@@ -373,10 +693,14 @@ def analyze_timesheet(timesheet: TimesheetData, screenshot_analysis=None) -> Tim
         timesheet.total_duration.total_seconds(),
     ) * 100
 
-    # FIX 5: Compute suspicious hours
+    # Compute suspicious hours
     suspicious_windows, suspicious_hours_str, suspicious_pct = _compute_suspicious_windows(
         timesheet.sessions, anomalies, screenshot_analysis,
     )
+
+    # Count overlaps and duplicates from anomalies
+    overlap_count = sum(1 for a in anomalies if a.anomaly_type == "overlapping_sessions")
+    duplicate_count = sum(1 for a in anomalies if a.anomaly_type == "duplicate_session")
 
     result = TimesheetAnalysisResult(
         total_sessions=stats["total_sessions"],
@@ -395,6 +719,19 @@ def analyze_timesheet(timesheet: TimesheetData, screenshot_analysis=None) -> Tim
         suspicious_hours_total=suspicious_hours_str,
         suspicious_pct=suspicious_pct,
         suspicious_windows=suspicious_windows,
+        # Enhanced stats
+        activity_std_dev=round(stats["activity_std_dev"], 2),
+        duration_std_dev=round(stats["duration_std_dev"], 2),
+        p25_duration_min=round(stats["p25_duration"], 1),
+        p75_duration_min=round(stats["p75_duration"], 1),
+        round_duration_pct=round(stats["round_duration_pct"], 1),
+        duplicate_session_count=duplicate_count,
+        overlapping_session_count=overlap_count,
+        max_daily_hours=round(stats["max_daily_hours"], 1),
+        days_over_12h=stats["days_over_12h"],
+        start_time_std_min=round(stats["start_time_std"], 1),
+        avg_gap_between_sessions_min=round(stats["avg_gap_min"], 1),
+        gap_std_dev_min=round(stats["gap_std_min"], 1),
     )
 
     # LLM reasoning on top of statistical analysis

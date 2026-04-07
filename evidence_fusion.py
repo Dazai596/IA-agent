@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -18,13 +19,18 @@ from models import (
     CrossAnalysisResult,
     FinalRiskAssessment,
     RiskLevel,
+    RiskScoreBreakdown,
     ScreenshotAnalysisResult,
     TimesheetAnalysisResult,
     ValidationResult,
 )
 from config import get_llm, get_settings
+from helpers import safe_parse_llm_json
 
 logger = logging.getLogger(__name__)
+
+
+# ── Rule-based cross-check ──────────────────────────────────────────────────
 
 
 def _rule_based_cross_check(
@@ -35,6 +41,7 @@ def _rule_based_cross_check(
     """
     Rule-based cross-analysis before LLM reasoning.
     Detects obvious contradictions and consistencies.
+    Now includes sample-size weighting.
     """
     contradictions: list[str] = []
     consistencies: list[str] = []
@@ -49,37 +56,42 @@ def _rule_based_cross_check(
             "CRITICAL: Timesheet and screenshot report cover different time periods."
         )
 
-    # Activity gap analysis
+    # Activity gap analysis with sample-size weighting
     activity_gap = abs(ts.overall_activity_pct - ss.work_pct)
 
-    if activity_gap > 30:
+    # Higher screenshot count = more reliable comparison
+    sample_confidence = min(1.0, ss.total_analyzed / 20.0)  # Full confidence at 20+ screenshots
+    gap_threshold_high = 30 - (10 * sample_confidence)  # 30pp with few screenshots, 20pp with many
+    gap_threshold_low = 15 - (5 * sample_confidence)
+
+    if activity_gap > gap_threshold_high:
         contradictions.append(
             f"Large activity gap: timesheet reports {ts.overall_activity_pct:.0f}% activity "
             f"but only {ss.work_pct:.0f}% of screenshots show work "
-            f"(gap: {activity_gap:.0f} percentage points)."
+            f"(gap: {activity_gap:.0f}pp, based on {ss.total_analyzed} screenshots)."
         )
-    elif activity_gap < 15:
+    elif activity_gap < gap_threshold_low:
         consistencies.append(
             f"Activity levels consistent: timesheet {ts.overall_activity_pct:.0f}% vs "
             f"screenshots {ss.work_pct:.0f}% work (gap: {activity_gap:.0f}pp)."
         )
 
     # Check for high non-work screenshots with high reported activity
-    if ss.non_work_pct > 20 and ts.overall_activity_pct > 80:
+    if ss.non_work_pct > 25 and ts.overall_activity_pct > 70:
         contradictions.append(
             f"Timesheet shows {ts.overall_activity_pct:.0f}% activity but "
             f"{ss.non_work_pct:.0f}% of screenshots show non-work content."
         )
 
-    # Check for high idle screenshots with high reported activity
-    if ss.idle_pct > 30 and ts.overall_activity_pct > 70:
+    # Check for high idle screenshots — more lenient for devs (idle during debugging)
+    if ss.idle_pct > 40 and ts.overall_activity_pct > 60:
         contradictions.append(
             f"Timesheet shows {ts.overall_activity_pct:.0f}% activity but "
             f"{ss.idle_pct:.0f}% of screenshots show idle screens."
         )
 
-    # Positive: high work + high activity
-    if ss.work_pct > 70 and ts.overall_activity_pct > 70:
+    # Positive: work + reasonable activity (lower threshold for devs)
+    if ss.work_pct > 60 and ts.overall_activity_pct > 35:
         consistencies.append(
             f"Strong work indicators: {ss.work_pct:.0f}% work screenshots and "
             f"{ts.overall_activity_pct:.0f}% timesheet activity."
@@ -105,18 +117,16 @@ def fuse_evidence(
     Step 1: Rule-based cross-check
     Step 2: LLM-assisted reasoning for nuance
     """
-    # Rule-based first
     result = _rule_based_cross_check(
         timesheet_analysis, screenshot_analysis, validation
     )
 
-    # LLM reasoning with enriched data
     if llm is None:
         llm = get_llm(temperature=0.0, max_tokens=2000)
 
-    # Build rich screenshot data — include per-screenshot classifications
+    # Build screenshot data (limit to avoid token overflow)
     screenshot_classifications = []
-    for c in screenshot_analysis.classifications[:50]:  # limit to avoid token overflow
+    for c in screenshot_analysis.classifications[:50]:
         screenshot_classifications.append({
             "timestamp": c.timestamp,
             "category": c.category.value,
@@ -125,7 +135,6 @@ def fuse_evidence(
             "apps": c.applications_visible,
         })
 
-    # Build rich timesheet data — include anomalies and daily breakdown
     anomaly_details = []
     for a in timesheet_analysis.anomalies:
         anomaly_details.append({
@@ -176,22 +185,17 @@ def fuse_evidence(
             HumanMessage(content=prompt),
         ])
         text = response.content.strip()
-        del response  # Free full response object
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
+        del response
 
-        data = json.loads(text)
-        result.reasoning = data.get("reasoning", "")
-
-        # Merge LLM-found contradictions/consistencies with rule-based ones
-        for c in data.get("contradictions", []):
-            if c not in result.contradictions:
-                result.contradictions.append(c)
-        for c in data.get("consistencies", []):
-            if c not in result.consistencies:
-                result.consistencies.append(c)
+        data = safe_parse_llm_json(text)
+        if data:
+            result.reasoning = data.get("reasoning", "")
+            for c in data.get("contradictions", []):
+                if c not in result.contradictions:
+                    result.contradictions.append(c)
+            for c in data.get("consistencies", []):
+                if c not in result.consistencies:
+                    result.consistencies.append(c)
 
     except Exception as e:
         logger.error(f"LLM evidence fusion failed: {e}")
@@ -200,284 +204,321 @@ def fuse_evidence(
     return result
 
 
-def generate_risk_assessment(
+# ── Risk scoring (refactored into sub-functions) ────────────────────────────
+
+
+def _compute_rule_based_score(
     validation: ValidationResult,
-    timesheet_analysis: Optional[TimesheetAnalysisResult],
-    screenshot_analysis: Optional[ScreenshotAnalysisResult],
-    cross_analysis: Optional[CrossAnalysisResult],
-    llm: Optional[ChatOpenAI] = None,
-) -> FinalRiskAssessment:
+    ts: Optional[TimesheetAnalysisResult],
+    ss: Optional[ScreenshotAnalysisResult],
+    ca: Optional[CrossAnalysisResult],
+) -> tuple[float, list[str], list[RiskScoreBreakdown]]:
     """
-    FIX 3: Rebuilt risk scoring model.
-
-    Scoring rules (additive, base = 0):
-      - Confirmed repeated identical frames: +30 each (up to 60)
-      - Tab-switching loop detected: +25
-      - Zero real productive activity across session: +15
-      - Monitor configuration change mid-day: +10
-      - Unauthorized site access: +15
-      - Third-party account found: +20
-      - Very long sessions with no work evidence: +10 each (up to 30)
-      - High non-work screenshots: +15
-      - Large activity gap (timesheet vs screenshots): +15
-      - Contradictions between sources: +10 each (up to 30)
-      - Very low overall activity: +10
-      - High suspicious hours percentage: +15
-
-    Risk levels:
-      - confirmed_fraud: >= 80
-      - high_risk: 60-79
-      - needs_review: 40-59
-      - low_risk: < 40
-      - invalid_bundle: data is fundamentally broken
-
-    Confidence capped at 0.4 if zero screenshots analyzed.
+    Compute rule-based risk score from all evidence.
+    Returns (score, findings_list, score_breakdown).
     """
-    # If the bundle is fundamentally invalid, short-circuit
-    if not validation.is_valid and validation.errors:
-        critical_errors = [e for e in validation.errors if "CRITICAL" in e.upper() or "different" in e.lower()]
-        if critical_errors:
-            return FinalRiskAssessment(
-                risk_score=0.0,
-                risk_level=RiskLevel.INVALID_BUNDLE,
-                confidence=0.9,
-                reasoning=f"Bundle is invalid: {'; '.join(validation.errors)}",
-                key_findings=validation.errors,
-                facts=validation.errors,
-                interpretations=["Cannot assess risk due to data mismatch."],
-            )
-
-    # ── Rule-based risk scoring ──────────────────────────────────────────
     risk_score = 0.0
     findings: list[str] = []
+    breakdown: list[RiskScoreBreakdown] = []
 
-    # --- Screenshot-derived signals (highest weight) ---
-    if screenshot_analysis:
-        # FIX 2: Repeated identical frames — strongest fraud signal
-        n_repeated = len(screenshot_analysis.repeated_frames)
+    def _add(signal: str, pts: float, desc: str):
+        nonlocal risk_score
+        risk_score += pts
+        findings.append(f"{desc} (+{pts:.0f} points)")
+        breakdown.append(RiskScoreBreakdown(signal_name=signal, points=pts, description=desc))
+
+    # --- Screenshot-derived signals ---
+    if ss:
+        # Repeated identical frames — strongest fraud signal
+        n_repeated = len(ss.repeated_frames)
         if n_repeated > 0:
             pts = min(60, n_repeated * 30)
-            risk_score += pts
-            findings.append(
-                f"CRITICAL: {n_repeated} repeated identical frame pair(s) detected "
-                f"(+{pts} points) — same frozen screen reappearing across time gaps"
+            _add(
+                "repeated_frames", pts,
+                f"{n_repeated} repeated identical frame pair(s) — same frozen screen reappearing"
             )
 
-        # FIX 4: Tab-switching loop
-        if screenshot_analysis.tab_switching_analysis and screenshot_analysis.tab_switching_analysis.loop_detected:
-            risk_score += 25
-            findings.append(
-                f"Tab-switching loop detected ({screenshot_analysis.tab_switching_analysis.loop_count} loops) "
-                f"— mechanical behavior suggesting automated simulation (+25 points)"
+        # Tab-switching loop
+        if ss.tab_switching_analysis and ss.tab_switching_analysis.loop_detected:
+            loop_pts = 15 + 10 * min(ss.tab_switching_analysis.loop_count, 3)
+            _add(
+                "tab_switching_loop", loop_pts,
+                f"Tab-switching loop ({ss.tab_switching_analysis.loop_count} loops) — mechanical behavior"
             )
 
-        # FIX 6: Monitor configuration change
-        if screenshot_analysis.monitor_inconsistencies:
-            risk_score += 10
-            findings.append(
-                f"Monitor configuration changed on {len(screenshot_analysis.monitor_inconsistencies)} day(s) "
-                f"— may indicate different person at screen (+10 points)"
+        # Monitor configuration change
+        if ss.monitor_inconsistencies:
+            n_days = len(ss.monitor_inconsistencies)
+            mon_pts = min(20, n_days * 10)
+            _add(
+                "monitor_change", mon_pts,
+                f"Monitor config changed on {n_days} day(s)"
             )
 
-        # FIX 7: Unauthorized site access
-        if screenshot_analysis.unauthorized_access_events:
-            risk_score += 15
-            findings.append(
-                f"{len(screenshot_analysis.unauthorized_access_events)} unauthorized site access event(s) "
-                f"detected (+15 points)"
+        # Unauthorized site access
+        if ss.unauthorized_access_events:
+            _add(
+                "unauthorized_sites", 15,
+                f"{len(ss.unauthorized_access_events)} unauthorized site access event(s)"
             )
 
-        # FIX 8: Third-party account
-        if screenshot_analysis.third_party_accounts:
-            risk_score += 20
-            findings.append(
-                f"SECURITY: {len(screenshot_analysis.third_party_accounts)} third-party account(s) "
-                f"found logged in on screen (+20 points)"
+        # Third-party account
+        if ss.third_party_accounts:
+            _add(
+                "third_party_accounts", 20,
+                f"{len(ss.third_party_accounts)} third-party account(s) on screen"
             )
 
-        # Zero real productive work across all screenshots
-        if screenshot_analysis.total_analyzed > 0 and screenshot_analysis.work_count == 0:
-            risk_score += 15
-            findings.append(
-                f"Zero work screenshots out of {screenshot_analysis.total_analyzed} analyzed "
-                f"— no productive activity detected (+15 points)"
+        # Zero productive work
+        if ss.total_analyzed > 0 and ss.work_count == 0:
+            _add(
+                "zero_work", 15,
+                f"Zero work in {ss.total_analyzed} screenshots"
             )
 
         # High non-work screenshots
-        if screenshot_analysis.non_work_pct > 30:
-            risk_score += 15
-            findings.append(f"High non-work screenshots: {screenshot_analysis.non_work_pct:.0f}% (+15 points)")
-        elif screenshot_analysis.non_work_pct > 15:
-            risk_score += 8
+        if ss.non_work_pct > 30:
+            _add("high_non_work", 15, f"{ss.non_work_pct:.0f}% non-work screenshots")
+        elif ss.non_work_pct > 15:
+            _add("moderate_non_work", 8, f"{ss.non_work_pct:.0f}% non-work screenshots")
 
-        # FIX 10: Suspicious sites
-        if screenshot_analysis.suspicious_sites:
-            risk_score += min(10, len(screenshot_analysis.suspicious_sites) * 5)
-            findings.append(
-                f"{len(screenshot_analysis.suspicious_sites)} suspicious site(s) detected on screen"
-            )
+        # Suspicious sites
+        if ss.suspicious_sites:
+            pts = min(10, len(ss.suspicious_sites) * 5)
+            _add("suspicious_sites", pts, f"{len(ss.suspicious_sites)} suspicious site(s) on screen")
 
     # --- Cross-analysis signals ---
-    if cross_analysis:
-        # Activity gap
-        if cross_analysis.activity_gap > 30:
-            risk_score += 15
-            findings.append(f"Large activity gap: {cross_analysis.activity_gap:.0f}pp between timesheet and screenshots (+15 points)")
-        elif cross_analysis.activity_gap > 15:
-            risk_score += 8
+    if ca:
+        if ca.activity_gap > 30:
+            _add("activity_gap", 15, f"Activity gap: {ca.activity_gap:.0f}pp between timesheet and screenshots")
+        elif ca.activity_gap > 15:
+            _add("moderate_activity_gap", 8, f"Activity gap: {ca.activity_gap:.0f}pp")
 
-        # Contradictions
-        n_contradictions = len(cross_analysis.contradictions)
+        n_contradictions = len(ca.contradictions)
         if n_contradictions > 0:
             pts = min(30, n_contradictions * 10)
-            risk_score += pts
-            findings.append(f"{n_contradictions} contradiction(s) between data sources (+{pts} points)")
+            _add("contradictions", pts, f"{n_contradictions} contradiction(s) between data sources")
 
     # --- Timesheet-only signals ---
-    if timesheet_analysis:
-        # Very long sessions with no screenshot work evidence
-        if timesheet_analysis.very_long_sessions > 0:
+    if ts:
+        # Very long sessions with no work evidence
+        # For devs, long sessions are normal — only flag if NO work visible in screenshots
+        if ts.very_long_sessions > 0:
             no_work_evidence = (
-                screenshot_analysis is None
-                or screenshot_analysis.total_analyzed == 0
-                or screenshot_analysis.work_pct < 20
+                ss is None or ss.total_analyzed == 0 or ss.work_pct < 15
             )
             if no_work_evidence:
-                pts = min(30, timesheet_analysis.very_long_sessions * 10)
-                risk_score += pts
-                findings.append(
-                    f"{timesheet_analysis.very_long_sessions} very long session(s) (>6h) "
-                    f"with no/low screenshot work evidence (+{pts} points)"
-                )
+                pts = min(20, ts.very_long_sessions * 8)  # Reduced weight for devs
+                _add("long_sessions_no_work", pts, f"{ts.very_long_sessions} very long session(s) with no work evidence")
 
-        # Very low overall activity
-        if timesheet_analysis.overall_activity_pct < 40:
-            risk_score += 10
-            findings.append(f"Very low overall activity: {timesheet_analysis.overall_activity_pct:.0f}% (+10 points)")
+        # Very low overall activity — lower threshold for devs (35% can be normal)
+        if ts.overall_activity_pct < 25:
+            _add("low_activity", 10, f"Very low overall activity: {ts.overall_activity_pct:.0f}% (even for developers, this is concerning)")
 
-        # FIX 5: High suspicious hours percentage
-        if timesheet_analysis.suspicious_pct > 40:
-            risk_score += 15
-            findings.append(
-                f"Suspicious hours: {timesheet_analysis.suspicious_hours_total} "
-                f"({timesheet_analysis.suspicious_pct:.0f}% of total) (+15 points)"
-            )
-        elif timesheet_analysis.suspicious_pct > 20:
-            risk_score += 8
+        # High suspicious hours
+        if ts.suspicious_pct > 40:
+            _add("high_suspicious_hours", 15, f"Suspicious hours: {ts.suspicious_hours_total} ({ts.suspicious_pct:.0f}% of total)")
+        elif ts.suspicious_pct > 20:
+            _add("moderate_suspicious_hours", 8, f"Suspicious hours: {ts.suspicious_hours_total} ({ts.suspicious_pct:.0f}%)")
 
         # Anomaly severity weighting
-        high_sev = sum(1 for a in timesheet_analysis.anomalies if a.severity == "high")
-        med_sev = sum(1 for a in timesheet_analysis.anomalies if a.severity == "medium")
+        high_sev = sum(1 for a in ts.anomalies if a.severity == "high")
+        med_sev = sum(1 for a in ts.anomalies if a.severity == "medium")
         anomaly_pts = min(15, high_sev * 5 + med_sev * 2)
         if anomaly_pts > 0:
-            risk_score += anomaly_pts
-            findings.append(f"{len(timesheet_analysis.anomalies)} timesheet anomalies (+{anomaly_pts} points)")
+            _add("anomalies", anomaly_pts, f"{len(ts.anomalies)} timesheet anomalies ({high_sev} high, {med_sev} medium)")
+
+        # NEW: Overlapping sessions
+        if ts.overlapping_session_count > 0:
+            _add("overlapping_sessions", 20, f"{ts.overlapping_session_count} overlapping session(s) — physically impossible")
+
+        # NEW: Duplicate sessions
+        if ts.duplicate_session_count > 0:
+            pts = min(15, ts.duplicate_session_count * 5)
+            _add("duplicate_sessions", pts, f"{ts.duplicate_session_count} duplicate session(s)")
+
+        # NEW: Suspiciously round durations
+        if ts.round_duration_pct > 70 and ts.total_sessions >= 5:
+            _add("round_durations", 10, f"{ts.round_duration_pct:.0f}% of sessions have round durations")
+
+        # NEW: Activity too stable (jiggler) — use config threshold
+        from config import get_settings as _get_settings
+        _settings = _get_settings()
+        if ts.activity_std_dev < _settings.activity_stability_threshold and ts.avg_activity_pct > 50 and ts.total_sessions >= 10:
+            _add("activity_too_stable", 15, f"Activity suspiciously stable: std_dev={ts.activity_std_dev:.1f}% (threshold: {_settings.activity_stability_threshold}%)")
+
+        # NEW: Regular start times — use config threshold
+        if ts.start_time_std_min < _settings.start_time_regularity_threshold and ts.total_sessions >= 7:
+            _add("regular_start_times", 8, f"Start times suspiciously regular: std_dev={ts.start_time_std_min:.0f} min")
+
+        # NEW: Excessive daily hours — use config threshold
+        if ts.days_over_12h > 0:
+            _add("excessive_daily_hours", min(15, ts.days_over_12h * 5), f"{ts.days_over_12h} day(s) with >{_settings.excessive_daily_hours:.0f}h billed")
+
+        # NEW: Regular inter-session gaps — use config threshold
+        if (ts.gap_std_dev_min > 0
+            and ts.gap_std_dev_min < _settings.gap_regularity_threshold
+            and ts.avg_gap_between_sessions_min > 0
+            and ts.total_sessions >= 5):
+            _add("regular_gaps", 8, f"Inter-session gaps suspiciously regular: std_dev={ts.gap_std_dev_min:.1f} min, mean={ts.avg_gap_between_sessions_min:.0f} min")
 
     risk_score = min(100.0, max(0.0, risk_score))
+    return risk_score, findings, breakdown
 
-    # ── Determine risk level from score ──────────────────────────────────
-    if risk_score >= 80:
-        risk_level = RiskLevel.CONFIRMED_FRAUD
-    elif risk_score >= 60:
-        risk_level = RiskLevel.HIGH_RISK
-    elif risk_score >= 40:
-        risk_level = RiskLevel.NEEDS_REVIEW
+
+def _determine_risk_level(score: float) -> RiskLevel:
+    """Map score to risk level."""
+    if score >= 80:
+        return RiskLevel.CONFIRMED_FRAUD
+    elif score >= 60:
+        return RiskLevel.HIGH_RISK
+    elif score >= 40:
+        return RiskLevel.NEEDS_REVIEW
     else:
-        risk_level = RiskLevel.LOW_RISK
+        return RiskLevel.LOW_RISK
 
-    # ── Confidence calculation ───────────────────────────────────────────
-    # Confidence reflects how much data supports the assessment
-    screenshots_analyzed = screenshot_analysis.total_analyzed if screenshot_analysis else 0
-    has_timesheet = timesheet_analysis is not None
-    has_cross = cross_analysis is not None
+
+def _compute_confidence(
+    ts: Optional[TimesheetAnalysisResult],
+    ss: Optional[ScreenshotAnalysisResult],
+    ca: Optional[CrossAnalysisResult],
+    n_findings: int,
+) -> float:
+    """Compute confidence based on available evidence."""
+    screenshots_analyzed = ss.total_analyzed if ss else 0
 
     base_confidence = 0.3
-    if has_timesheet:
+    if ts is not None:
         base_confidence += 0.2
     if screenshots_analyzed > 0:
-        base_confidence += min(0.3, screenshots_analyzed * 0.03)  # Up to +0.3 for 10+ screenshots
-    if has_cross:
+        # Logarithmic scaling: diminishing returns after ~30 screenshots
+        base_confidence += min(0.3, 0.1 + 0.2 * (1 - math.exp(-screenshots_analyzed / 15)))
+    if ca is not None:
         base_confidence += 0.1
-    if len(findings) > 3:
-        base_confidence += 0.1  # More evidence = more confidence
+    if n_findings > 3:
+        base_confidence += 0.1
 
-    # CRITICAL: Cap at 0.4 if zero screenshots analyzed
+    # Cap at 0.5 if zero screenshots (was 0.4, raised slightly for enhanced timesheet analysis)
     if screenshots_analyzed == 0:
-        base_confidence = min(0.4, base_confidence)
+        base_confidence = min(0.5, base_confidence)
 
-    confidence = min(1.0, max(0.0, base_confidence))
+    return min(1.0, max(0.0, base_confidence))
 
-    # ── LLM reasoning ────────────────────────────────────────────────────
+
+def _generate_recommendations(risk_level: RiskLevel, findings: list[str]) -> list[str]:
+    """Generate actionable recommendations based on risk level and findings."""
+    recs: list[str] = []
+
+    if risk_level == RiskLevel.CONFIRMED_FRAUD:
+        recs.append("Immediate investigation required — strong evidence of fraud or manipulation.")
+        recs.append("Consider suspending billing for this period pending review.")
+        recs.append("Request detailed work log or screen recordings for verification.")
+        recs.append("Consult legal/compliance team if financial impact is significant.")
+    elif risk_level == RiskLevel.HIGH_RISK:
+        recs.append("Manager should conduct a detailed review of this audit.")
+        recs.append("Request employee explanation for flagged anomalies.")
+        recs.append("Compare against previous audit periods for pattern changes.")
+        recs.append("Consider requiring more frequent check-ins or deliverable reviews.")
+    elif risk_level == RiskLevel.NEEDS_REVIEW:
+        recs.append("Manager spot-check recommended for flagged sessions.")
+        recs.append("Monitor for pattern persistence in future audit periods.")
+        if any("activity" in f.lower() for f in findings):
+            recs.append("Discuss expected activity levels with the employee.")
+    else:
+        recs.append("No immediate action required — work appears legitimate.")
+        recs.append("Continue standard audit schedule.")
+
+    return recs
+
+
+def _invoke_llm_for_assessment(
+    validation: ValidationResult,
+    ts: Optional[TimesheetAnalysisResult],
+    ss: Optional[ScreenshotAnalysisResult],
+    ca: Optional[CrossAnalysisResult],
+    llm: Optional[ChatOpenAI] = None,
+) -> dict:
+    """Invoke LLM for detailed reasoning. Returns parsed dict or empty dict on failure."""
     if llm is None:
         llm = get_llm(temperature=0.0, max_tokens=4000)
 
-    # Build rich timesheet payload
+    # Build payloads
     ts_payload = {}
-    if timesheet_analysis:
+    if ts:
         anomaly_list = [
             {"date": a.session_date, "type": a.anomaly_type, "desc": a.description, "severity": a.severity}
-            for a in timesheet_analysis.anomalies
+            for a in ts.anomalies
         ]
         ts_payload = {
-            "total_sessions": timesheet_analysis.total_sessions,
-            "total_hours": timesheet_analysis.total_duration_hours,
-            "active_hours": timesheet_analysis.total_active_hours,
-            "overall_activity_pct": timesheet_analysis.overall_activity_pct,
-            "avg_session_min": timesheet_analysis.avg_session_duration_min,
-            "avg_activity_pct": timesheet_analysis.avg_activity_pct,
-            "min_activity_pct": timesheet_analysis.min_activity_pct,
-            "max_activity_pct": timesheet_analysis.max_activity_pct,
-            "sessions_below_50_pct": timesheet_analysis.sessions_below_50_pct,
-            "very_short_sessions": timesheet_analysis.very_short_sessions,
-            "very_long_sessions": timesheet_analysis.very_long_sessions,
-            "daily_breakdown": timesheet_analysis.daily_breakdown,
+            "total_sessions": ts.total_sessions,
+            "total_hours": ts.total_duration_hours,
+            "active_hours": ts.total_active_hours,
+            "overall_activity_pct": ts.overall_activity_pct,
+            "avg_session_min": ts.avg_session_duration_min,
+            "avg_activity_pct": ts.avg_activity_pct,
+            "min_activity_pct": ts.min_activity_pct,
+            "max_activity_pct": ts.max_activity_pct,
+            "sessions_below_50_pct": ts.sessions_below_50_pct,
+            "very_short_sessions": ts.very_short_sessions,
+            "very_long_sessions": ts.very_long_sessions,
+            "daily_breakdown": ts.daily_breakdown,
             "anomalies": anomaly_list,
-            "suspicious_hours_total": timesheet_analysis.suspicious_hours_total,
-            "suspicious_pct": timesheet_analysis.suspicious_pct,
-            "llm_reasoning": timesheet_analysis.reasoning,
+            "suspicious_hours_total": ts.suspicious_hours_total,
+            "suspicious_pct": ts.suspicious_pct,
+            "llm_reasoning": ts.reasoning,
+            # Enhanced stats
+            "activity_std_dev": ts.activity_std_dev,
+            "duration_std_dev": ts.duration_std_dev,
+            "p25_duration_min": ts.p25_duration_min,
+            "p75_duration_min": ts.p75_duration_min,
+            "round_duration_pct": ts.round_duration_pct,
+            "duplicate_sessions": ts.duplicate_session_count,
+            "overlapping_sessions": ts.overlapping_session_count,
+            "days_over_12h": ts.days_over_12h,
+            "start_time_std_min": ts.start_time_std_min,
+            "avg_gap_between_sessions_min": ts.avg_gap_between_sessions_min,
+            "gap_std_dev_min": ts.gap_std_dev_min,
         }
 
-    # Build rich screenshot payload — include advanced analysis results
     ss_payload = {"summary": "No screenshots analyzed"}
-    if screenshot_analysis:
+    if ss:
         top_classifications = [
             {"ts": c.timestamp, "cat": c.category.value, "conf": c.confidence, "desc": c.description}
-            for c in screenshot_analysis.classifications[:30]
+            for c in ss.classifications[:30]
         ]
         repeated_summary = [
             {"first": r.first_occurrence, "repeat": r.repeat_occurrence,
              "gap_min": r.time_gap_minutes, "similarity": r.similarity_score}
-            for r in screenshot_analysis.repeated_frames
+            for r in ss.repeated_frames
         ]
         ss_payload = {
-            "total_analyzed": screenshot_analysis.total_analyzed,
-            "work_count": screenshot_analysis.work_count,
-            "work_pct": screenshot_analysis.work_pct,
-            "non_work_count": screenshot_analysis.non_work_count,
-            "non_work_pct": screenshot_analysis.non_work_pct,
-            "idle_count": screenshot_analysis.idle_count,
-            "idle_pct": screenshot_analysis.idle_pct,
-            "uncertain_count": screenshot_analysis.uncertain_count,
-            "summary": screenshot_analysis.summary,
+            "total_analyzed": ss.total_analyzed,
+            "work_count": ss.work_count,
+            "work_pct": ss.work_pct,
+            "non_work_count": ss.non_work_count,
+            "non_work_pct": ss.non_work_pct,
+            "idle_count": ss.idle_count,
+            "idle_pct": ss.idle_pct,
+            "uncertain_count": ss.uncertain_count,
+            "summary": ss.summary,
             "sample_classifications": top_classifications,
             "repeated_frames": repeated_summary,
-            "tab_switching": screenshot_analysis.tab_switching_analysis.model_dump() if screenshot_analysis.tab_switching_analysis else None,
-            "monitor_inconsistencies": len(screenshot_analysis.monitor_inconsistencies),
-            "unauthorized_access_events": len(screenshot_analysis.unauthorized_access_events),
-            "third_party_accounts": len(screenshot_analysis.third_party_accounts),
-            "suspicious_sites": [s.site_name for s in screenshot_analysis.suspicious_sites],
+            "tab_switching": ss.tab_switching_analysis.model_dump() if ss.tab_switching_analysis else None,
+            "monitor_inconsistencies": len(ss.monitor_inconsistencies),
+            "unauthorized_access_events": len(ss.unauthorized_access_events),
+            "third_party_accounts": len(ss.third_party_accounts),
+            "suspicious_sites": [s.site_name for s in ss.suspicious_sites],
         }
 
-    # Build cross-analysis payload
     ca_payload = {}
-    if cross_analysis:
+    if ca:
         ca_payload = {
-            "contradictions": cross_analysis.contradictions,
-            "consistencies": cross_analysis.consistencies,
-            "screenshot_work_pct": cross_analysis.screenshot_work_pct,
-            "timesheet_activity_pct": cross_analysis.timesheet_activity_pct,
-            "activity_gap": cross_analysis.activity_gap,
-            "reasoning": cross_analysis.reasoning,
+            "contradictions": ca.contradictions,
+            "consistencies": ca.consistencies,
+            "screenshot_work_pct": ca.screenshot_work_pct,
+            "timesheet_activity_pct": ca.timesheet_activity_pct,
+            "activity_gap": ca.activity_gap,
+            "reasoning": ca.reasoning,
         }
 
     prompt = FINAL_REPORT_PROMPT.format(
@@ -494,13 +535,59 @@ def generate_risk_assessment(
         ])
         text = response.content.strip()
         del response
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
+        return safe_parse_llm_json(text)
+    except Exception as e:
+        logger.error(f"LLM risk assessment failed: {e}")
+        return {}
 
-        data = json.loads(text)
 
+def generate_risk_assessment(
+    validation: ValidationResult,
+    timesheet_analysis: Optional[TimesheetAnalysisResult],
+    screenshot_analysis: Optional[ScreenshotAnalysisResult],
+    cross_analysis: Optional[CrossAnalysisResult],
+    llm: Optional[ChatOpenAI] = None,
+) -> FinalRiskAssessment:
+    """
+    Generate final risk assessment combining rule-based scoring + LLM reasoning.
+    """
+    # If the bundle is fundamentally invalid, short-circuit
+    if not validation.is_valid and validation.errors:
+        critical_errors = [e for e in validation.errors if "CRITICAL" in e.upper() or "different" in e.lower()]
+        if critical_errors:
+            return FinalRiskAssessment(
+                risk_score=0.0,
+                risk_level=RiskLevel.INVALID_BUNDLE,
+                confidence=0.9,
+                reasoning=f"Bundle is invalid: {'; '.join(validation.errors)}",
+                key_findings=validation.errors,
+                facts=validation.errors,
+                interpretations=["Cannot assess risk due to data mismatch."],
+                recommendations=["Re-submit with matching timesheet and screenshot data."],
+            )
+
+    # Step 1: Rule-based scoring
+    risk_score, findings, breakdown = _compute_rule_based_score(
+        validation, timesheet_analysis, screenshot_analysis, cross_analysis,
+    )
+
+    # Step 2: Determine risk level
+    risk_level = _determine_risk_level(risk_score)
+
+    # Step 3: Compute confidence
+    confidence = _compute_confidence(
+        timesheet_analysis, screenshot_analysis, cross_analysis, len(findings),
+    )
+
+    # Step 4: Generate recommendations
+    recommendations = _generate_recommendations(risk_level, findings)
+
+    # Step 5: LLM reasoning
+    data = _invoke_llm_for_assessment(
+        validation, timesheet_analysis, screenshot_analysis, cross_analysis, llm,
+    )
+
+    if data:
         return FinalRiskAssessment(
             risk_score=risk_score,
             risk_level=risk_level,
@@ -510,16 +597,18 @@ def generate_risk_assessment(
             facts=data.get("facts", []),
             interpretations=data.get("interpretations", []),
             fraud_assessment=data.get("fraud_assessment", ""),
+            score_breakdown=breakdown,
+            recommendations=recommendations,
         )
 
-    except Exception as e:
-        logger.error(f"LLM risk assessment failed: {e}")
-        return FinalRiskAssessment(
-            risk_score=risk_score,
-            risk_level=risk_level,
-            confidence=confidence,
-            reasoning=f"Rule-based assessment (LLM unavailable: {e}). Score driven by: {'; '.join(findings)}",
-            key_findings=findings,
-            facts=findings,
-            interpretations=["LLM reasoning unavailable — assessment based on rules only."],
-        )
+    return FinalRiskAssessment(
+        risk_score=risk_score,
+        risk_level=risk_level,
+        confidence=confidence,
+        reasoning=f"Rule-based assessment (LLM unavailable). Score driven by: {'; '.join(findings)}",
+        key_findings=findings,
+        facts=findings,
+        interpretations=["LLM reasoning unavailable — assessment based on rules only."],
+        score_breakdown=breakdown,
+        recommendations=recommendations,
+    )

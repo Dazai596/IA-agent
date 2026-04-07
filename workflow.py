@@ -274,7 +274,7 @@ def node_validate(state: AuditState) -> dict:
         warnings.append("Screenshot data is missing — analysis will be partial.")
 
     if ts and ss:
-        # Date overlap check
+        # Date overlap check with overlap percentage
         ts_start = ts.get("date_range_start", "")
         ts_end = ts.get("date_range_end", "")
         ss_start = ss.get("date_range_start", "")
@@ -282,6 +282,7 @@ def node_validate(state: AuditState) -> dict:
 
         if ts_start and ss_start:
             from dateutil import parser as dateparser
+            from helpers import compute_date_overlap_pct
             try:
                 ts_s = dateparser.parse(ts_start)
                 ts_e = dateparser.parse(ts_end) if ts_end else ts_s
@@ -290,6 +291,13 @@ def node_validate(state: AuditState) -> dict:
 
                 if ts_s <= ss_e and ss_s <= ts_e:
                     date_overlap = True
+                    overlap_pct = compute_date_overlap_pct(ts_start, ts_end, ss_start, ss_end)
+                    if overlap_pct < 70:
+                        warnings.append(
+                            f"Low date overlap: only {overlap_pct:.0f}% of data overlaps. "
+                            f"Timesheet: {ts_start} – {ts_end}, Screenshots: {ss_start} – {ss_end}. "
+                            f"Cross-analysis will be limited."
+                        )
                 else:
                     date_overlap = False
                     errors.append(
@@ -527,14 +535,17 @@ def _build_session_reports(
             work = sum(1 for c in date_screenshots if c.category == ScreenshotCategory.WORK)
 
             if non_work > 0:
-                session_score += non_work * 5
+                # For devs, occasional non-work screenshot is less severe
+                non_work_ratio = non_work / max(ss_count, 1)
+                session_score += non_work * 4  # Was 5, reduced for devs
                 findings.append(SessionFinding(
                     finding_type="non_work_screenshots",
                     description=f"{non_work} of {ss_count} screenshots show non-work activity",
-                    severity="medium" if non_work / max(ss_count, 1) > 0.3 else "low",
+                    severity="medium" if non_work_ratio > 0.4 else "low",
                 ))
-            if idle > 0 and idle / max(ss_count, 1) > 0.5:
-                session_score += 10
+            # Idle threshold raised for devs (debugging = staring at code)
+            if idle > 0 and idle / max(ss_count, 1) > 0.6:
+                session_score += 8  # Was 10
                 findings.append(SessionFinding(
                     finding_type="high_idle",
                     description=f"{idle} of {ss_count} screenshots show idle screen",
@@ -544,7 +555,7 @@ def _build_session_reports(
                 session_score += 15
                 findings.append(SessionFinding(
                     finding_type="zero_work",
-                    description=f"No work detected in any of {ss_count} screenshots",
+                    description=f"No developer tools or work detected in any of {ss_count} screenshots",
                     severity="high",
                 ))
 
@@ -615,10 +626,17 @@ def _generate_work_summary(
             f"Total hours: {timesheet_analysis.total_duration_hours:.1f}h, "
             f"Active hours: {timesheet_analysis.total_active_hours:.1f}h, "
             f"Overall activity: {timesheet_analysis.overall_activity_pct:.1f}%, "
+            f"Activity std dev: {timesheet_analysis.activity_std_dev:.1f}%, "
             f"Avg session: {timesheet_analysis.avg_session_duration_min:.0f} min, "
+            f"Duration P25/P75: {timesheet_analysis.p25_duration_min:.0f}/{timesheet_analysis.p75_duration_min:.0f} min, "
             f"Sessions below 50% activity: {timesheet_analysis.sessions_below_50_pct}, "
             f"Very short sessions (<5 min): {timesheet_analysis.very_short_sessions}, "
             f"Very long sessions (>6h): {timesheet_analysis.very_long_sessions}, "
+            f"Round-duration sessions: {timesheet_analysis.round_duration_pct:.0f}%, "
+            f"Overlapping sessions: {timesheet_analysis.overlapping_session_count}, "
+            f"Duplicate sessions: {timesheet_analysis.duplicate_session_count}, "
+            f"Days >12h billed: {timesheet_analysis.days_over_12h}, "
+            f"Start time std dev: {timesheet_analysis.start_time_std_min:.0f} min, "
             f"Daily breakdown: {timesheet_analysis.daily_breakdown}, "
             f"Suspicious hours: {timesheet_analysis.suspicious_hours_total} ({timesheet_analysis.suspicious_pct:.1f}% of total)"
         )
